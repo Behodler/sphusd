@@ -5,6 +5,7 @@ import {ERC4626} from "@openzeppelin/contracts/token/ERC20/extensions/ERC4626.so
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
@@ -25,9 +26,11 @@ import {IPhlimboV3Minimal} from "./interfaces/IPhlimboV3Minimal.sol";
 ///        and keeps earning until a keeper calls `flushWithdrawals`, which unstakes and burns it.
 ///      - `swap(token, recipient)` sells the vault's whole balance of a configured reward token
 ///        (USDC first, Phlimbo promo tokens as configured) for an owner-set phUSD price; that phUSD
-///        joins `pendingDeposits` and lifts the share price.
+///        joins `pendingDeposits` and lifts the share price gradually: it vests linearly over
+///        `VESTING_PERIOD`, as do captured Phlimbo phUSD emissions. A same-transaction (or
+///        same-block) deposit -> swap -> redeem therefore captures nothing.
 ///      - Accounting is explicit: `totalAssets() = stakedInPhlimbo + pendingDeposits -
-///        pendingWithdrawals`. Donated phUSD is never counted.
+///        pendingWithdrawals - unvestedProceeds()`. Donated phUSD is never counted.
 ///      - Keeper rewards are minted phUSD (inflationary, by design) or paid out of owed phUSD that
 ///        is being burnt anyway, so no keeper reward is ever paid out of holders' assets.
 ///      - No code path pays any token to `owner()`.
@@ -44,6 +47,11 @@ contract StakedPhUSD is ERC4626, Ownable, Pausable, ReentrancyGuard, IPausable {
 
     /// @dev Decimals offset for OZ's virtual-share inflation-attack defence (sphUSD has 21 decimals).
     uint8 private constant DECIMALS_OFFSET = 3;
+
+    /// @notice Period over which swap proceeds and captured emissions vest into `totalAssets`.
+    /// @dev Defeats just-in-time capture: a deposit made just before a swap and redeemed just after
+    ///      earns only the slice that vested while it was held, as any other holder does.
+    uint256 public constant VESTING_PERIOD = 7 days;
 
     // ========================== IMMUTABLES ==========================
 
@@ -91,6 +99,15 @@ contract StakedPhUSD is ERC4626, Ownable, Pausable, ReentrancyGuard, IPausable {
 
     /// @notice Address authorised to pause (the global PauserV2). `address(0)` disables pausing.
     address public pauser;
+
+    /// @notice Proceeds still unvested at `vestingStart` (swap phUSD and captured emissions).
+    uint256 public vestingAmount;
+
+    /// @notice Start of the current vesting schedule (last time proceeds were added).
+    uint256 public vestingStart;
+
+    /// @notice End of the current vesting schedule; nothing is unvested from then on.
+    uint256 public vestingEnd;
 
     // ========================== ERRORS ==========================
 
@@ -150,6 +167,11 @@ contract StakedPhUSD is ERC4626, Ownable, Pausable, ReentrancyGuard, IPausable {
     /// @notice phUSD emitted by Phlimbo was captured into `pendingDeposits`.
     /// @param amount The emission captured.
     event EmissionsCaptured(uint256 amount);
+    /// @notice Proceeds were added to the vesting schedule.
+    /// @param added The proceeds added.
+    /// @param unvested Total unvested after the addition (carried-over remainder + `added`).
+    /// @param vestingEnd When the whole `unvested` amount will have vested.
+    event ProceedsVesting(uint256 added, uint256 unvested, uint256 vestingEnd);
     /// @notice `stakePending` ran.
     /// @param keeper The caller.
     /// @param rewardRecipient The reward recipient.
@@ -246,10 +268,26 @@ contract StakedPhUSD is ERC4626, Ownable, Pausable, ReentrancyGuard, IPausable {
 
     // ========================== ERC4626 ==========================
 
-    /// @notice Assets backing the shares: staked position plus idle phUSD, minus phUSD owed to nobody.
+    /// @notice Assets backing the shares: staked position plus idle phUSD, minus phUSD owed to nobody,
+    ///         minus swap proceeds and emissions that have not vested yet.
+    /// @dev Unvested proceeds are physically held (idle or staked) but not yet counted, so the share
+    ///      price rises linearly over `VESTING_PERIOD` instead of in one step. Saturates at 0
+    ///      defensively; by construction the held amount always covers the unvested amount.
     /// @return The vault's assets in phUSD.
     function totalAssets() public view override returns (uint256) {
-        return stakedInPhlimbo + pendingDeposits - pendingWithdrawals;
+        uint256 held = stakedInPhlimbo + pendingDeposits - pendingWithdrawals;
+        uint256 unvested = unvestedProceeds();
+        return held > unvested ? held - unvested : 0;
+    }
+
+    /// @notice Swap proceeds and captured emissions not yet vested into `totalAssets`.
+    /// @dev Linear from `vestingAmount` at `vestingStart` to 0 at `vestingEnd`, rounded up so the
+    ///      rounding favours the vault.
+    /// @return The unvested phUSD.
+    function unvestedProceeds() public view returns (uint256) {
+        uint256 end = vestingEnd;
+        if (block.timestamp >= end) return 0;
+        return Math.mulDiv(vestingAmount, end - block.timestamp, end - vestingStart, Math.Rounding.Ceil);
     }
 
     /// @notice 0 while paused; otherwise unlimited.
@@ -410,7 +448,7 @@ contract StakedPhUSD is ERC4626, Ownable, Pausable, ReentrancyGuard, IPausable {
     /// @dev Claims Phlimbo first (skipped while Phlimbo is paused or the vault has no position) so the
     ///      payout includes freshly claimed rewards; then reads `balanceOf`. A claim may also drop
     ///      other reward tokens; they stay for their own `swap`. The phUSD paid joins
-    ///      `pendingDeposits`, raising the share price.
+    ///      `pendingDeposits` and vests into the share price over `VESTING_PERIOD`.
     /// @param token The reward token to buy.
     /// @param recipient Receiver of the token balance.
     /// @return payout Amount of `token` paid out.
@@ -437,6 +475,7 @@ contract StakedPhUSD is ERC4626, Ownable, Pausable, ReentrancyGuard, IPausable {
         token.safeTransfer(recipient, payout);
 
         pendingDeposits += price;
+        _vest(price);
 
         emit Swapped(msg.sender, address(token), recipient, price, payout);
     }
@@ -625,12 +664,24 @@ contract StakedPhUSD is ERC4626, Ownable, Pausable, ReentrancyGuard, IPausable {
         }
     }
 
-    /// @dev Add Phlimbo phUSD emissions (measured by balance delta) to `pendingDeposits`.
+    /// @dev Add Phlimbo phUSD emissions (measured by balance delta) to `pendingDeposits`, vesting.
     function _captureEmission(uint256 amount) internal {
         if (amount > 0) {
             pendingDeposits += amount;
+            _vest(amount);
             emit EmissionsCaptured(amount);
         }
+    }
+
+    /// @dev Restart the vesting schedule with the still-unvested remainder plus `amount`, vesting
+    ///      linearly over a fresh `VESTING_PERIOD`. The share price is unchanged at the call (the
+    ///      remainder is carried exactly) and never decreases afterwards.
+    function _vest(uint256 amount) internal {
+        uint256 unvested = unvestedProceeds() + amount;
+        vestingAmount = unvested;
+        vestingStart = block.timestamp;
+        vestingEnd = block.timestamp + VESTING_PERIOD;
+        emit ProceedsVesting(amount, unvested, block.timestamp + VESTING_PERIOD);
     }
 
     /// @dev Re-read the vault's Phlimbo position (absorbs the dust rule).

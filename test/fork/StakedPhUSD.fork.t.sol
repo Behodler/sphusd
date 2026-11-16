@@ -131,14 +131,17 @@ contract StakedPhUSDForkTest is Test {
         uint256 pending = phlimbo.pendingStable(address(vault));
         assertGt(pending, 0, "vault accrued USDC");
 
-        // 4. swap: keeper pays 1 phUSD for the accrued USDC; share price rises
+        // 4. swap: keeper pays 1 phUSD for the accrued USDC; the proceeds vest into the share price
         uint256 priceBefore = vault.convertToAssets(1e21);
         vm.prank(keeper);
         uint256 payout = vault.swap(usdc, keeper);
         _checkOwner();
         assertGe(payout, pending, "payout includes the freshly claimed USDC");
         assertEq(usdc.balanceOf(keeper), payout);
-        assertGt(vault.convertToAssets(1e21), priceBefore, "share price rose");
+        assertEq(vault.convertToAssets(1e21), priceBefore, "no step: proceeds start unvested");
+        vm.warp(block.timestamp + vault.VESTING_PERIOD());
+        assertEq(vault.unvestedProceeds(), 0);
+        assertGt(vault.convertToAssets(1e21), priceBefore, "share price rose once vested");
         console2.log("USDC paid to keeper (6dp):", payout);
 
         // 5. redeem: alice exits, paid from idle first then minted

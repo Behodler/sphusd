@@ -41,9 +41,18 @@ contract StakedPhUSDSwapAdminTest is StakedPhUSDBase {
 
         assertEq(payout, 53e6);
         assertEq(usdc.balanceOf(keeper), 53e6);
-        assertEq(vault.totalAssets(), assetsBefore + USDC_PRICE);
         assertEq(vault.pendingDeposits(), USDC_PRICE);
-        assertGt(_price(), priceBefore, "share price rises");
+        assertEq(vault.totalAssets(), assetsBefore, "proceeds start fully unvested");
+        assertEq(vault.unvestedProceeds(), USDC_PRICE);
+        _assertAccounting();
+
+        vm.warp(block.timestamp + vault.VESTING_PERIOD() / 2);
+        assertEq(vault.totalAssets(), assetsBefore + USDC_PRICE / 2, "linear vesting");
+        assertGt(_price(), priceBefore, "share price rises while vesting");
+        _assertAccounting();
+
+        _vestAll();
+        assertEq(vault.totalAssets(), assetsBefore + USDC_PRICE);
         _assertAccounting();
     }
 
@@ -88,7 +97,8 @@ contract StakedPhUSDSwapAdminTest is StakedPhUSDBase {
         uint256 payout = vault.swap(IERC20(address(promo)), keeper);
         assertEq(payout, 500e18);
         assertEq(promo.balanceOf(keeper), 500e18);
-        assertEq(vault.totalAssets(), assetsBefore + PROMO_PRICE);
+        _vestAll();
+        assertEq(vault.totalAssets(), assetsBefore + USDC_PRICE + PROMO_PRICE);
         _assertAccounting();
     }
 

@@ -14,7 +14,12 @@ sphUSD is the working name for an ERC20 vault token with name "Staked PhUSD" and
   stake, withdraw and claim. Anyone may `swap` the vault's whole balance of a configured reward
   token for an owner-set phUSD price; that phUSD joins the vault's assets and raises the share
   price.
-- **Accounting** is explicit: `totalAssets = stakedInPhlimbo + pendingDeposits - pendingWithdrawals`.
+- **Vesting.** Swap proceeds and captured phUSD emissions vest linearly over `VESTING_PERIOD`
+  (7 days); a new swap carries the unvested remainder into a fresh schedule. The share price
+  therefore rises smoothly, and a just-in-time deposit around a swap (deposit -> swap -> redeem,
+  even in one transaction) captures only the slice that vests while it is held.
+- **Accounting** is explicit:
+  `totalAssets = stakedInPhlimbo + pendingDeposits - pendingWithdrawals - unvestedProceeds()`.
   Donated tokens never move the share price. OZ's decimals offset (3, so sphUSD has 21 decimals)
   defends against the inflation attack.
 - Keeper rewards are minted phUSD (or paid from owed phUSD being burnt) and are configured by the

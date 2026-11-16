@@ -23,6 +23,9 @@ contract StakedPhUSDHandler is Test {
     /// @notice Set if any action lowered the share price by more than rounding dust.
     bool public priceDecreased;
 
+    /// @notice Set if a same-block deposit -> swap -> redeem recovered any of the swap price.
+    bool public jitExtracted;
+
     uint256 internal constant DUST = 2;
 
     constructor(
@@ -93,6 +96,36 @@ contract StakedPhUSDHandler is Test {
         vault.swap(IERC20(address(usdc)), keeper);
     }
 
+    /// @dev Same-block deposit -> swap -> redeem by one actor. It must never recover any of the
+    ///      swap price (proceeds vest; they do not step the share price).
+    function jitSwap(uint256 seed, uint256 amount, uint256 usdcAmount) external trackPrice {
+        address a = _actor(seed);
+        amount = bound(amount, 1, 1_000_000e18);
+        usdcAmount = bound(usdcAmount, 1e6, 100e6);
+        if (phlimbo.totalStaked() > 0) {
+            usdc.mint(address(this), usdcAmount);
+            usdc.approve(address(phlimbo), usdcAmount);
+            phlimbo.distributeStable(usdcAmount);
+        } else {
+            usdc.mint(address(vault), usdcAmount);
+        }
+        uint256 price = vault.swapPrice(address(usdc));
+        uint256 start = phUSD.balanceOf(a);
+        vm.startPrank(a);
+        uint256 shares = vault.deposit(amount, a);
+        vault.swap(IERC20(address(usdc)), a);
+        if (shares > 0) vault.redeem(shares, a, a);
+        vm.stopPrank();
+        if (phUSD.balanceOf(a) + price > start) jitExtracted = true;
+    }
+
+    /// @dev Let time pass so vesting progresses between other actions.
+    function warp(uint256 secs) external trackPrice {
+        secs = bound(secs, 1, 3 days);
+        vm.warp(block.timestamp + secs);
+        vm.roll(block.number + secs / 12 + 1);
+    }
+
     function emission(uint256 amount) external trackPrice {
         if (phlimbo.totalStaked() == 0) return;
         amount = bound(amount, 1, 10e18);
@@ -141,7 +174,14 @@ contract StakedPhUSDInvariantTest is StakedPhUSDBase {
     function invariant_totalAssetsIdentity() public view {
         assertEq(vault.stakedInPhlimbo(), _phlimboPosition(), "staked reconciles with Phlimbo");
         assertEq(
-            vault.totalAssets(), _phlimboPosition() + vault.pendingDeposits() - vault.pendingWithdrawals(), "identity"
+            vault.totalAssets(),
+            _phlimboPosition() + vault.pendingDeposits() - vault.pendingWithdrawals() - vault.unvestedProceeds(),
+            "identity"
+        );
+        assertLe(
+            vault.unvestedProceeds(),
+            _phlimboPosition() + vault.pendingDeposits() - vault.pendingWithdrawals(),
+            "unvested proceeds are held"
         );
         assertLe(vault.pendingWithdrawals(), _phlimboPosition(), "owed phUSD is still staked");
         assertGe(phUSD.balanceOf(address(vault)), vault.pendingDeposits(), "idle phUSD is held");
@@ -149,6 +189,10 @@ contract StakedPhUSDInvariantTest is StakedPhUSDBase {
 
     function invariant_sharePriceNeverDecreases() public view {
         assertFalse(handler.priceDecreased(), "share price decreased");
+    }
+
+    function invariant_sameBlockJitNeverExtracts() public view {
+        assertFalse(handler.jitExtracted(), "same-block deposit/swap/redeem recovered swap price");
     }
 
     function invariant_solvent() public view {

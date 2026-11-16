@@ -111,10 +111,16 @@ abstract contract StakedPhUSDBase is Test {
         assertEq(vault.stakedInPhlimbo(), _phlimboPosition(), "staked reconciles");
         assertEq(
             vault.totalAssets(),
-            _phlimboPosition() + vault.pendingDeposits() - vault.pendingWithdrawals(),
+            _phlimboPosition() + vault.pendingDeposits() - vault.pendingWithdrawals() - vault.unvestedProceeds(),
             "totalAssets identity"
         );
         assertGe(phUSD.balanceOf(address(vault)), vault.pendingDeposits(), "idle phUSD backed");
+    }
+
+    /// @dev Let every swap proceed / emission vest fully.
+    function _vestAll() internal {
+        vm.warp(block.timestamp + vault.VESTING_PERIOD());
+        assertEq(vault.unvestedProceeds(), 0, "fully vested");
     }
 
     /// @dev Assets per 1e18 phUSD worth of shares (1 whole share unit of 21 decimals).

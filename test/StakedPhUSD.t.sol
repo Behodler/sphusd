@@ -394,6 +394,8 @@ contract StakedPhUSDCoreTest is StakedPhUSDBase {
 
         assertEq(_phlimboPosition(), 1200e18);
         assertEq(vault.pendingDeposits(), 10e18, "emission captured into pendingDeposits");
+        assertEq(vault.unvestedProceeds(), 10e18, "emission vests");
+        _vestAll();
         assertGt(_price(), priceBefore, "emission compounds into the share price");
         _assertAccounting();
     }

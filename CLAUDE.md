@@ -30,9 +30,12 @@ forge fmt --check
 
 ## Invariants (do not break)
 
-- `totalAssets() == stakedInPhlimbo + pendingDeposits - pendingWithdrawals`. Accounting is
-  explicit; never derive assets from `balanceOf`, so donations and reward drops never move the
-  share price.
+- `totalAssets() == stakedInPhlimbo + pendingDeposits - pendingWithdrawals - unvestedProceeds()`.
+  Accounting is explicit; never derive assets from `balanceOf`, so donations and reward drops never
+  move the share price.
+- Swap proceeds and captured emissions vest linearly over `VESTING_PERIOD`; they must never step
+  the share price, or a deposit -> swap -> redeem in one transaction captures them (see
+  `test/StakedPhUSD.jit.t.sol`). New proceeds carry the unvested remainder into a fresh schedule.
 - `stakedInPhlimbo` is reconciled from `phlimbo.userInfo(vault).amount` after every Phlimbo call
   (absorbs Phlimbo's dust full-withdraw rule).
 - Every Phlimbo call is wrapped in phUSD balance-delta measurement; emissions go to
